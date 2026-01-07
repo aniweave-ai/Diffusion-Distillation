@@ -1,109 +1,137 @@
 from typing import Tuple
-from einops import rearrange
-from torch import nn
-import torch.distributed as dist
-import torch
 
-from pipeline import SelfForcingTrainingPipeline, BidirectionalTrainingPipeline
+import torch
+from torch import nn
+
+from pipeline.image_edit_training import ImageEditTrainingPipeline
 from utils.loss import get_denoising_loss
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper, WanCLIPEncoder
+from utils.qwen_image_edit_wrapper import (
+    CONDITION_IMAGE_SIZE,
+    VAE_IMAGE_SIZE,
+    QwenImageEditWrapper,
+    calculate_dimensions,
+)
 
 
 class BaseModel(nn.Module):
     def __init__(self, args, device):
         super().__init__()
-        self.is_causal = args.generator_type == "causal"
-        self.i2v = args.i2v
         self._initialize_models(args, device)
 
         self.device = device
         self.args = args
         self.dtype = torch.bfloat16 if args.mixed_precision else torch.float32
         if hasattr(args, "denoising_step_list"):
-            self.denoising_step_list = torch.tensor(args.denoising_step_list, dtype=torch.long)
+            self.denoising_step_list = torch.tensor(
+                args.denoising_step_list, dtype=torch.long
+            )
             if args.warp_denoising_step:
-                timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
+                timesteps = torch.cat(
+                    (
+                        self.scheduler.timesteps.cpu(),
+                        torch.tensor([0], dtype=torch.float32),
+                    )
+                )
                 self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
     def _initialize_models(self, args, device):
-        self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-14B")
-        self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-14B")
-        self.generator_name = getattr(args, "generator_name", "Wan2.1-T2V-14B")
+        teacher_lora_path = args.teacher_lora_path
+        student_lora_path = args.student_lora_path
+        critic_lora_path = args.critic_lora_path
+        model_name = args.model_name
 
-        self.generator = WanDiffusionWrapper(
-            **getattr(args, "model_kwargs", {}),
-            model_name=self.generator_name,
-            is_causal=self.is_causal
+        self.qwen_image_edit_wrapper = QwenImageEditWrapper(
+            model_name=model_name,
+            teacher_lora_path=teacher_lora_path,
+            student_lora_path=student_lora_path,
+            critic_lora_path=critic_lora_path,
+            device=device,
         )
-        self.generator.model.requires_grad_(True)
+        self.qwen_image_edit_wrapper.freeze_all()
 
-        self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
-        self.real_score.model.requires_grad_(False)
-
-        self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
-        self.fake_score.model.requires_grad_(True)
-
-        self.text_encoder = WanTextEncoder(model_name=self.generator_name)
-        self.text_encoder.requires_grad_(False)
-
-        self.vae = WanVAEWrapper(model_name=self.generator_name)
-        self.vae.requires_grad_(False)
-
-        if self.i2v:
-            self.image_encoder = WanCLIPEncoder(model_name=self.generator_name)
-            self.image_encoder.requires_grad_(False)
+        self.generator = self.qwen_image_edit_wrapper
+        self.real_score = self.qwen_image_edit_wrapper
+        self.fake_score = self.qwen_image_edit_wrapper
 
         self.scheduler = self.generator.get_scheduler()
         self.scheduler.timesteps = self.scheduler.timesteps.to(device)
 
+        self.text_encoder = self.qwen_image_edit_wrapper.pipe.text_encoder
+
+    def _get_wrapper(self):
+        """Helper to get the unwrapped QwenImageEditWrapper."""
+        if hasattr(self.qwen_image_edit_wrapper, "module"):
+            return self.qwen_image_edit_wrapper.module
+        return self.qwen_image_edit_wrapper
+
+    def switch_to_generator(self):
+        self._get_wrapper().switch_to_generator()
+
+    def switch_to_real(self):
+        self._get_wrapper().switch_to_real()
+
+    def switch_to_fake(self):
+        self._get_wrapper().switch_to_fake()
+
     def _get_timestep(
-            self,
-            min_timestep: int,
-            max_timestep: int,
-            batch_size: int,
-            num_frame: int,
-            num_frame_per_block: int,
-            uniform_timestep: bool = False
+        self,
+        min_timestep: int,
+        max_timestep: int,
+        batch_size: int,
+        num_frame: int = 1,
     ) -> torch.Tensor:
         """
-        Randomly generate a timestep tensor based on the generator's task type. It uniformly samples a timestep
+        Randomly generate a timestep tensor. It uniformly samples a timestep
         from the range [min_timestep, max_timestep], and returns a tensor of shape [batch_size, num_frame].
-        - If uniform_timestep, it will use the same timestep for all frames.
-        - If not uniform_timestep, it will use a different timestep for each block.
         """
-        if uniform_timestep:
-            timestep = torch.randint(
-                min_timestep,
-                max_timestep,
-                [batch_size, 1],
-                device=self.device,
-                dtype=torch.long
-            ).repeat(1, num_frame)
-            return timestep
-        else:
-            timestep = torch.randint(
-                min_timestep,
-                max_timestep,
-                [batch_size, num_frame],
-                device=self.device,
-                dtype=torch.long
+        timestep = torch.randint(
+            min_timestep,
+            max_timestep,
+            [batch_size, 1],
+            device=self.device,
+            dtype=torch.long,
+        ).repeat(1, num_frame)
+        return timestep
+
+    def run_vae_encoder(self, image: torch.Tensor) -> torch.Tensor:
+        image_width, image_height = image.shape[2], image.shape[3]
+        aspect_ratio = image_width / image_height
+
+        vae_width, vae_height = calculate_dimensions(VAE_IMAGE_SIZE, aspect_ratio)
+        vae_image = (
+            self.real_score.pipe.image_processor.preprocess(
+                image, vae_height, vae_width
             )
-            # make the noise level the same within every block
-            if self.independent_first_frame:
-                # the first frame is always kept the same
-                timestep_from_second = timestep[:, 1:]
-                timestep_from_second = timestep_from_second.reshape(
-                    timestep_from_second.shape[0], -1, num_frame_per_block)
-                timestep_from_second[:, :, 1:] = timestep_from_second[:, :, 0:1]
-                timestep_from_second = timestep_from_second.reshape(
-                    timestep_from_second.shape[0], -1)
-                timestep = torch.cat([timestep[:, 0:1], timestep_from_second], dim=1)
-            else:
-                timestep = timestep.reshape(
-                    timestep.shape[0], -1, num_frame_per_block)
-                timestep[:, :, 1:] = timestep[:, :, 0:1]
-                timestep = timestep.reshape(timestep.shape[0], -1)
-            return timestep
+            .to(device=self.device, dtype=self.dtype)
+            .unsqueeze(2)
+        )
+        image_latent = self.qwen_image_edit_wrapper.encode_vae_img(vae_image)
+
+        return image_latent
+
+    def encode_prompt(self, image: torch.Tensor, prompt: str) -> dict:
+        image_width, image_height = image.shape[2], image.shape[3]
+        aspect_ratio = image_width / image_height
+
+        condition_width, condition_height = calculate_dimensions(
+            CONDITION_IMAGE_SIZE, aspect_ratio
+        )
+        condition_image = self.qwen_image_edit_wrapper.pipe.image_processor.preprocess(
+            image, condition_height, condition_width
+        )
+
+        prompt_embeds, prompt_masks = self.qwen_image_edit_wrapper.pipe.encode_prompt(
+            prompt=prompt,
+            image=condition_image,
+            device=self.device,
+        )
+
+        cond_dict = {
+            "prompt_embeds": prompt_embeds.to(self.dtype),
+            "prompt_embeds_mask": prompt_masks.to(self.dtype),
+        }
+
+        return cond_dict
 
 
 class SelfForcingModel(BaseModel):
@@ -116,90 +144,102 @@ class SelfForcingModel(BaseModel):
         image_or_video_shape,
         conditional_dict: dict,
         initial_latent: torch.tensor = None,
-        clip_fea: torch.Tensor = None,
-        y: torch.Tensor = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
         """
-        Optionally simulate the generator's input from noise using backward simulation
-        and then run the generator for one-step.
+        Simulate the generator's input from noise using backward simulation (Trajectory Replay).
+        Adapted for Image Editing.
+
         Input:
-            - image_or_video_shape: a list containing the shape of the image or video [B, F, C, H, W].
-            - conditional_dict: a dictionary containing the conditional information (e.g. text embeddings, image embeddings).
-            - unconditional_dict: a dictionary containing the unconditional information (e.g. null/negative text embeddings, null/negative image embeddings).
-            - clean_latent: a tensor containing the clean latents [B, F, C, H, W]. Need to be passed when no backward simulation is used.
-            - initial_latent: a tensor containing the initial latents [B, F, C, H, W].
+            - image_or_video_shape: [B, C, H, W] or [B, 1, C, H, W].
+            - initial_latent: The Source Image Latent (the image we want to edit).
+            - conditional_dict: Contains text embeddings, masks, etc.
         Output:
-            - pred_image: a tensor with shape [B, F, C, H, W].
-            - denoised_timestep: an integer
+            - pred_image: The predicted x0 at the exit step [B, C, H, W].
+            - gradient_mask: None (Apply loss to full image).
+            - denoised_timestep_from: The step where simulation stopped.
+            - denoised_timestep_to: The next step (usually 0 if final).
         """
-        # Step 1: Sample noise and backward simulate the generator's input
-        assert getattr(self.args, "backward_simulation", True), "Backward simulation needs to be enabled"
+
+        # Step 2: Prepare Conditioning (Source Image)
+        # In Image Editing, 'initial_latent' is the source image we want to edit.
+        # We map it to 'source_image_latent' which ImageEditTrainingPipeline expects.
         if initial_latent is not None:
-            conditional_dict["initial_latent"] = initial_latent
-        if self.args.i2v:
-            noise_shape = [image_or_video_shape[0], image_or_video_shape[1] - 1, *image_or_video_shape[2:]]
-        else:
-            noise_shape = image_or_video_shape.copy()
+            # Handle 5D input from video dataloaders [B, F, C, H, W] or [B, C, F, H, W] -> [B, C, H, W]
+            if initial_latent.dim() == 5:
+                if initial_latent.shape[1] == 1:
+                    initial_latent = initial_latent.squeeze(1)
+                elif initial_latent.shape[2] == 1:
+                    initial_latent = initial_latent.squeeze(2)
 
-        # During training, the number of generated frames should be uniformly sampled from
-        # [21, self.num_training_frames], but still being a multiple of self.num_frame_per_block
-        min_num_frames = 20 if self.args.independent_first_frame else 21
-        max_num_frames = self.num_training_frames - 1 if self.args.independent_first_frame else self.num_training_frames
-        assert max_num_frames % self.num_frame_per_block == 0
-        assert min_num_frames % self.num_frame_per_block == 0
-        max_num_blocks = max_num_frames // self.num_frame_per_block
-        min_num_blocks = min_num_frames // self.num_frame_per_block
-        num_generated_blocks = torch.randint(min_num_blocks, max_num_blocks + 1, (1,), device=self.device)
-        dist.broadcast(num_generated_blocks, src=0)
-        num_generated_blocks = num_generated_blocks.item()
-        num_generated_frames = num_generated_blocks * self.num_frame_per_block
-        if self.args.independent_first_frame and initial_latent is None:
-            num_generated_frames += 1
-            min_num_frames += 1
-        # Sync num_generated_frames across all processes
-        noise_shape[1] = num_generated_frames
+            conditional_dict["source_image_latent"] = initial_latent
 
-        pred_image_or_video, denoised_timestep_from, denoised_timestep_to = self._consistency_backward_simulation(
-            noise=torch.randn(noise_shape,
-                              device=self.device, dtype=self.dtype),
-            clip_fea=clip_fea,
-            y=y,
-            **conditional_dict
-        )
-        # Slice last 21 frames
-        if pred_image_or_video.shape[1] > 21:
-            with torch.no_grad():
-                # Reencode to get image latent
-                latent_to_decode = pred_image_or_video[:, :-20, ...]
-                # Deccode to video
-                pixels = self.vae.decode_to_pixel(latent_to_decode)
-                frame = pixels[:, -1:, ...].to(self.dtype)
-                frame = rearrange(frame, "b t c h w -> b c t h w")
-                # Encode frame to get image latent
-                image_latent = self.vae.encode_to_latent(frame).to(self.dtype)
-            pred_image_or_video_last_21 = torch.cat([image_latent, pred_image_or_video[:, -20:, ...]], dim=1)
-        else:
-            pred_image_or_video_last_21 = pred_image_or_video
+        # Step 3: Prepare Noise
+        # Normalize shape to [B, C, H, W]
+        noise_shape = list(image_or_video_shape)
 
-        if num_generated_frames != min_num_frames:
-            # Currently, we do not use gradient for the first chunk, since it contains image latents
-            gradient_mask = torch.ones_like(pred_image_or_video_last_21, dtype=torch.bool)
-            if self.args.independent_first_frame:
-                gradient_mask[:, :1] = False
+        if len(noise_shape) == 5:
+            # Drop frame dimension if present.
+            # We handle both [B, F, C, H, W] and [B, C, F, H, W]
+            if noise_shape[1] == 1:
+                # [B, F, C, H, W] -> [B, C, H, W]
+                noise_shape = [
+                    noise_shape[0],
+                    noise_shape[2],
+                    noise_shape[3],
+                    noise_shape[4],
+                ]
+            elif noise_shape[2] == 1:
+                # [B, C, F, H, W] -> [B, C, H, W]
+                noise_shape = [
+                    noise_shape[0],
+                    noise_shape[1],
+                    noise_shape[3],
+                    noise_shape[4],
+                ]
             else:
-                gradient_mask[:, :self.num_frame_per_block] = False
-        else:
-            gradient_mask = None
+                # Default to dropping index 1 if neither is 1 (e.g. video)
+                noise_shape = [
+                    noise_shape[0],
+                    noise_shape[2],
+                    noise_shape[3],
+                    noise_shape[4],
+                ]
 
-        pred_image_or_video_last_21 = pred_image_or_video_last_21.to(self.dtype)
-        return pred_image_or_video_last_21, gradient_mask, denoised_timestep_from, denoised_timestep_to
+        noise = torch.randn(noise_shape, device=self.device, dtype=self.dtype)
+        # Step 4: Run Backward Simulation
+        # This calls ImageEditTrainingPipeline.inference_with_trajectory
+        pred_image, denoised_timestep_from, denoised_timestep_to = (
+            self._consistency_backward_simulation(
+                noise=noise,
+                conditional_dict=conditional_dict,
+            )
+        )
+
+        # Step 5: Handle Outputs
+        # pred_image should be [B, C, H, W] (or [B, 1, C, H, W] depending on wrapper return)
+        # Ensure it is 4D for consistency with standard image losses
+        if pred_image.dim() == 5:
+            if pred_image.shape[1] == 1:
+                pred_image = pred_image.squeeze(1)
+            elif pred_image.shape[2] == 1:
+                pred_image = pred_image.squeeze(2)
+
+        # Gradient Mask:
+        # For video, this masked out history frames. For single image editing,
+        # we usually want to train on the entire image.
+        gradient_mask = None
+
+        return (
+            pred_image,
+            gradient_mask,
+            denoised_timestep_from,
+            denoised_timestep_to,
+        )
 
     def _consistency_backward_simulation(
         self,
         noise: torch.Tensor,
-        clip_fea: torch.Tensor,
-        y: torch.Tensor,
-        **conditional_dict: dict
+        conditional_dict: dict,
     ) -> torch.Tensor:
         """
         Simulate the generator's input from noise to avoid training/inference mismatch.
@@ -217,7 +257,9 @@ class SelfForcingModel(BaseModel):
             self._initialize_inference_pipeline()
 
         return self.inference_pipeline.inference_with_trajectory(
-            noise=noise, clip_fea=clip_fea, y=y, **conditional_dict
+            noise=noise,
+            conditional_dict=conditional_dict,
+            source_image_latent=conditional_dict.get("source_image_latent"),
         )
 
     def _initialize_inference_pipeline(self):
@@ -226,23 +268,10 @@ class SelfForcingModel(BaseModel):
         Here we encapsulate the inference code with a model-dependent outside function.
         We pass our FSDP-wrapped modules into the pipeline to save memory.
         """
-        if self.is_causal:
-            self.inference_pipeline = SelfForcingTrainingPipeline(
-                model_name=self.generator_name,
-                denoising_step_list=self.denoising_step_list,
-                scheduler=self.scheduler,
-                generator=self.generator,
-                num_frame_per_block=self.num_frame_per_block,
-                independent_first_frame=self.args.independent_first_frame,
-                same_step_across_blocks=self.args.same_step_across_blocks,
-                last_step_only=self.args.last_step_only,
-                num_max_frames=self.num_training_frames,
-                context_noise=self.args.context_noise
-            )
-        else:
-            self.inference_pipeline = BidirectionalTrainingPipeline(
-                model_name=self.generator_name,
-                denoising_step_list=self.denoising_step_list,
-                scheduler=self.scheduler,
-                generator=self.generator,
-            )
+
+        self.inference_pipeline = ImageEditTrainingPipeline(
+            model_name=self.args.model_name,
+            denoising_step_list=self.denoising_step_list,
+            scheduler=self.scheduler,
+            generator=self.generator,
+        )
