@@ -1,0 +1,7 @@
+__pycache__
+test_data
+*.egg-info
+models
+qwen_training_data
+qwen_distillation_data
+wandb
