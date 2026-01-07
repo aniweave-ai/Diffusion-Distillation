@@ -1,45 +1,80 @@
+import os
+import time
 from datetime import timedelta
 from functools import partial
-import os
+
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, StateDictType
+from torch.distributed.fsdp import (
+    FullStateDictConfig,
+    MixedPrecision,
+    ShardingStrategy,
+    StateDictType,
+)
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import CPUOffload
-from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
+from torch.distributed.fsdp.wrap import (
+    size_based_auto_wrap_policy,
+    transformer_auto_wrap_policy,
+)
+
+from utils.qwen_image_edit_wrapper import GENERATOR_LORA_NAME
 
 
 def fsdp_state_dict(model):
-    fsdp_fullstate_save_policy = FullStateDictConfig(
-        offload_to_cpu=True, rank0_only=True
-    )
-    with FSDP.state_dict_type(
-        model, StateDictType.FULL_STATE_DICT, fsdp_fullstate_save_policy
-    ):
-        checkpoint = model.state_dict()
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-    return checkpoint
+    # 1. Check if the model is wrapped in FSDP
+    if isinstance(model, FSDP):
+        fsdp_fullstate_save_policy = FullStateDictConfig(
+            offload_to_cpu=True, rank0_only=True
+        )
+        with FSDP.state_dict_type(
+            model, StateDictType.FULL_STATE_DICT, fsdp_fullstate_save_policy
+        ):
+            checkpoint = model.state_dict()
+        return checkpoint
+
+    # 2. Handle Standard Model (Single GPU / No FSDP)
+    else:
+        # We manually move state_dict to CPU to mimic the offload_to_cpu=True behavior
+        # and ensure it doesn't spike VRAM during save.
+        return {k: v.cpu() for k, v in model.state_dict().items()}
 
 
-def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_strategy="size", min_num_params=int(5e7), transformer_module=None, ignored_modules=None, cpu_offload=False):
+def fsdp_wrap(
+    module,
+    sharding_strategy="full",
+    mixed_precision=False,
+    wrap_strategy="size",
+    min_num_params=int(5e7),
+    transformer_module=None,
+    ignored_modules=None,
+    cpu_offload=False,
+):
+    # --- CHANGE START: Auto-disable FSDP for Single GPU ---
+    if dist.is_initialized() and dist.get_world_size() == 1:
+        print("World Size is 1: Disabling FSDP and using standard CUDA model.")
+        return module.to(torch.cuda.current_device())
+    # --- CHANGE END ---
+
     if mixed_precision:
         mixed_precision_policy = MixedPrecision(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             buffer_dtype=torch.float32,
-            cast_forward_inputs=False
+            cast_forward_inputs=False,
         )
     else:
         mixed_precision_policy = None
 
     if wrap_strategy == "transformer":
         auto_wrap_policy = partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls=transformer_module
+            transformer_auto_wrap_policy, transformer_layer_cls=transformer_module
         )
     elif wrap_strategy == "size":
         auto_wrap_policy = partial(
-            size_based_auto_wrap_policy,
-            min_num_params=min_num_params
+            size_based_auto_wrap_policy, min_num_params=min_num_params
         )
     else:
         raise ValueError(f"Invalid wrap strategy: {wrap_strategy}")
@@ -63,7 +98,7 @@ def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_stra
         use_orig_params=True,
         ignored_modules=ignored_modules,
         cpu_offload=CPUOffload(offload_params=cpu_offload),
-        sync_module_states=False  # Load ckpt on rank 0 and sync to other ranks
+        sync_module_states=False,
     )
     return module
 
@@ -84,8 +119,13 @@ def launch_distributed_job(backend: str = "nccl"):
         init_method = f"tcp://[{host}]:{port}"
     else:  # IPv4
         init_method = f"tcp://{host}:{port}"
-    dist.init_process_group(rank=rank, world_size=world_size, backend=backend,
-                            init_method=init_method, timeout=timedelta(minutes=30))
+    dist.init_process_group(
+        rank=rank,
+        world_size=world_size,
+        backend=backend,
+        init_method=init_method,
+        timeout=timedelta(minutes=30),
+    )
     torch.cuda.set_device(local_rank)
 
 
@@ -97,30 +137,61 @@ class EMA_FSDP:
 
     @torch.no_grad()
     def _init_shadow(self, fsdp_module):
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        with FSDP.summon_full_params(fsdp_module, writeback=False, offload_to_cpu=True, rank0_only=True):
-            for n, p in fsdp_module.module.named_parameters():
+        # Handle FSDP case
+        if isinstance(fsdp_module, FSDP):
+            with FSDP.summon_full_params(
+                fsdp_module, writeback=False, offload_to_cpu=True, rank0_only=True
+            ):
+                for n, p in fsdp_module.module.named_parameters():
+                    self.shadow[n] = p.detach().clone().float().cpu()
+        # Handle Standard/Single-GPU case
+        else:
+            for n, p in fsdp_module.named_parameters():
+                # ema is only work on generator, and we train lora so we don't have to copy the entire model.
+                if GENERATOR_LORA_NAME not in n:
+                    continue
                 self.shadow[n] = p.detach().clone().float().cpu()
 
     @torch.no_grad()
     def update(self, fsdp_module):
         d = self.decay
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        with FSDP.summon_full_params(fsdp_module, writeback=False, offload_to_cpu=True, rank0_only=True):
-            for n, p in fsdp_module.module.named_parameters():
-                self.shadow[n].mul_(d).add_(p.detach().float().cpu(), alpha=1. - d)
 
-    # Optional helpers ---------------------------------------------------
+        # Helper to update shadow params
+        def update_params(module_params):
+            for n, p in module_params:
+                if n in self.shadow:
+                    self.shadow[n].mul_(d).add_(p.detach().float().cpu(), alpha=1.0 - d)
+
+        torch.cuda.synchronize()
+        start_time = time.time()
+
+        if isinstance(fsdp_module, FSDP):
+            with FSDP.summon_full_params(
+                fsdp_module, writeback=False, offload_to_cpu=True, rank0_only=True
+            ):
+                update_params(fsdp_module.module.named_parameters())
+        else:
+            update_params(fsdp_module.named_parameters())
+        torch.cuda.synchronize()
+        ema_update_time = time.time() - start_time
+        return {
+            "ema_update_time": ema_update_time,
+        }
+
     def state_dict(self):
-        return self.shadow            # picklable
+        return self.shadow
 
     def load_state_dict(self, sd):
         self.shadow = {k: v.clone() for k, v in sd.items()}
 
     def copy_to(self, fsdp_module):
-        # load EMA weights into an (unwrapped) copy of the generator
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        with FSDP.summon_full_params(fsdp_module, writeback=True):
-            for n, p in fsdp_module.module.named_parameters():
+        # load EMA weights into the generator
+        if isinstance(fsdp_module, FSDP):
+            with FSDP.summon_full_params(fsdp_module, writeback=True):
+                for n, p in fsdp_module.module.named_parameters():
+                    if n in self.shadow:
+                        p.data.copy_(self.shadow[n].to(p.dtype, device=p.device))
+        else:
+            for n, p in fsdp_module.named_parameters():
                 if n in self.shadow:
                     p.data.copy_(self.shadow[n].to(p.dtype, device=p.device))
